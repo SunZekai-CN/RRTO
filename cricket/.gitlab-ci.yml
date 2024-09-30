@@ -1,0 +1,245 @@
+variables:
+  GIT_STRATEGY: fetch
+  GIT_SUBMODULE_STRATEGY: recursive
+# PREFIX: /usr/
+  DOCKER_FILE: utils/Dockerfile
+  DOCKER_TAG: ${CI_COMMIT_REF_NAME}
+  DOCKER_IMAGE_DEV: cricket
+  # MAKE_OPTS: -j 16
+
+before_script:
+    #  - git config --local core.longpaths true
+    #- git submodule sync --recursive
+    #- git submodule update --init --recursive
+
+stages:
+  - prepare
+  - build
+  - test
+
+# Stage: prepare
+##############################################################################
+
+# Build docker image
+prepare:rocky9:docker-dev:
+  stage: prepare
+  script:
+    - docker build
+        --file ${DOCKER_FILE}
+        --tag ${DOCKER_IMAGE_DEV}:${DOCKER_TAG}
+        --tag ${DOCKER_IMAGE_DEV}:latest .
+  tags:
+    - docker
+
+prepare:centos8:cuda11:
+  stage: prepare
+  script:
+    - docker build
+        --file utils/Dockerfile.cuda11
+        --tag ${DOCKER_IMAGE_DEV}_cuda11:${DOCKER_TAG}
+        --tag ${DOCKER_IMAGE_DEV}_cuda11:latest .
+  tags:
+    - docker
+
+# check if styleguide is fulfilled
+#style_check:
+#  stage: build
+#  image: ${DOCKER_IMAGE_DEV}:${DOCKER_TAG}
+#  allow_failure: true
+#  tags:
+#    - docker
+#  script:
+#    - ls
+#    - utils/test_style.sh
+
+# Stage: build
+##############################################################################
+
+build:
+  stage: build
+  needs: ["prepare:rocky9:docker-dev"]
+  script:
+   - make -j 32 libtirpc
+   - make -j 32 cuda-gdb
+   - make -j 1 LOG=INFO
+   - make -j 1 tests LOG=INFO
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - bin
+      - tests/bin
+      - tests/samples/samples-bin
+  image: ${DOCKER_IMAGE_DEV}:${DOCKER_TAG}
+  cache:
+    paths:
+      - gpu/build
+      - cpu/*.o
+      - submodules/libtirpc
+      - submodules/cuda-gdb
+      - submodules/cuda-gdb-src.rpm
+    key: build
+  tags:
+    - docker
+
+build:ib:
+  stage: build
+  needs: ["prepare:rocky9:docker-dev"]
+  script:
+   - make -j 32 libtirpc
+   - make -j 32 cuda-gdb
+   - make -j 1 LOG=INFO WITH_IB=yes
+   - make -j 1 tests LOG=INFO
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - bin
+      - tests/bin
+  image: ${DOCKER_IMAGE_DEV}:${DOCKER_TAG}
+  cache:
+    paths:
+      - gpu/build
+      - cpu/*.o
+      - tests/*.o
+      - tests/test_apps/*.o
+      - tests/cpu/*.o
+      - submodules/libtirpc
+      - submodules/cuda-gdb
+      - submodules/cuda-gdb-src.rpm
+    key: buildib
+  tags:
+    - docker
+
+build:cuda11:
+  stage: build
+  needs: ["prepare:centos8:cuda11"]
+  script:
+   - make -j 32 libtirpc
+   - make -j 32 cuda-gdb
+   - make -j 1 LOG=INFO NOSAMPLES=yes
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - bin
+      - tests/bin
+  image: ${DOCKER_IMAGE_DEV}_cuda11:${DOCKER_TAG}
+  cache:
+    paths:
+      - gpu/build
+      - cpu/*.o
+      - tests/cpu/*.o
+      - tests/test_apps/*.o
+      - submodules/libtirpc
+      - submodules/cuda-gdb
+      - submodules/cuda-gdb-src.rpm
+    key: build_cuda11
+  tags:
+    - docker
+
+build:debug:
+  stage: build
+  needs: ["prepare:rocky9:docker-dev"]
+  script:
+   - make -j 32 libtirpc
+   - make -j 32 cuda-gdb
+   - make -j 1 LOG=INFO WITH_DEBUG=yes
+   - make -j 1 tests LOG=INFO WITH_DEBUG=yes
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - bin
+      - tests/bin
+  image: ${DOCKER_IMAGE_DEV}:${DOCKER_TAG}
+  cache:
+    paths:
+      - gpu/build
+      - cpu/*.o
+      - tests/cpu/*.o
+      - tests/test_apps/*.o
+      - submodules/libtirpc
+      - submodules/cuda-gdb
+      - submodules/cuda-gdb-src.rpm
+    key: build_debug
+  tags:
+    - docker
+
+.remote-gpu:
+  stage: test
+  needs: ["build"]
+  variables:
+    GPU_TARGET: 'gitlab-runner@ghost'
+    RDIR: '/tmp/gitlab-jobs/$CI_PROJECT_NAME/$CI_JOB_ID'
+    LDIR: '$CI_BUILDS_DIR/$CI_PROJECT_PATH/bin'
+    SAMPLES_PATH: '/usr/local/cuda/samples'
+    PARAMETER: ''
+    CHDIR: 'tests'
+  script:
+    - mkdir ~/.ssh &&
+      echo "-----BEGIN OPENSSH PRIVATE KEY-----" > ~/.ssh/id_rsa &&
+      echo $SSH_PRIVATE | sed "s/\S\{64\}/&\n/g" >> ~/.ssh/id_rsa &&
+      echo "-----END OPENSSH PRIVATE KEY-----" >> ~/.ssh/id_rsa &&
+      echo $SSH_PUBLIC > ~/.ssh/id_rsa.pub &&
+      echo $KNOWN_HOSTS > ~/.ssh/known_hosts && chmod 600 ~/.ssh/id_rsa
+    - ssh $GPU_TARGET mkdir -p $RDIR
+    - scp -r $LDIR/* $GPU_TARGET:$RDIR/
+    - ssh $GPU_TARGET "LD_PRELOAD=$RDIR/libtirpc.so.3 $RDIR/cricket-rpc-server 255" &
+    - sleep 2
+    - cd $LDIR/$CHDIR
+    - CRICKET_RPCID=255 REMOTE_GPU_ADDRESS="ghost.acs-lab.eonerc.rwth-aachen.de" PATH=$LDIR:$PATH LD_PRELOAD=$LDIR/libtirpc.so.3:$LDIR/cricket-client.so ./$TEST_BINARY $PARAMETER
+  after_script:
+    - ssh $GPU_TARGET rm -rf $RDIR
+    - ssh $GPU_TARGET pkill -fe -2 $RDIR/test_kernel
+  image: ${DOCKER_IMAGE_DEV}:${DOCKER_TAG}
+  dependencies:
+    - build
+  tags:
+    - docker
+
+test:test_programs(1/2):
+  stage: test
+  needs: ["build:debug"]
+  script:
+      - CRICKET_DISABLE_RPC=yes LD_LIBRARY_PATH="./bin:$LD_LIBRARY_PATH" bin/tests/test_list.test
+  image: ${DOCKER_IMAGE_DEV}:${DOCKER_TAG}
+  dependencies:
+    - build:debug
+  tags:
+    - docker
+
+test:test_programs(2/2):
+  stage: test
+  needs: ["build:debug"]
+  script:
+      - CRICKET_DISABLE_RPC=yes LD_LIBRARY_PATH="./bin:$LD_LIBRARY_PATH" bin/tests/test_resource_mg.test
+  image: ${DOCKER_IMAGE_DEV}:${DOCKER_TAG}
+  dependencies:
+    - build:debug
+  tags:
+    - docker
+
+test:test_kernel:
+    extends: .remote-gpu
+    variables:
+      TEST_BINARY: 'kernel.testapp'
+
+test:samples:matrixMul:
+    extends: .remote-gpu
+    variables:
+      TEST_BINARY: 'matrixMul.compressed.sample'
+
+test:samples:bandwidthTest:
+    extends: .remote-gpu
+    variables:
+      TEST_BINARY: 'bandwidthTest.sample'
+
+test:samples:nbody:
+    extends: .remote-gpu
+    variables:
+      TEST_BINARY: 'nbody.uncompressed.sample'
+      PARAMETER: '-benchmark'
+
+test:samples:mnistCUDNN:
+    extends: .remote-gpu
+    variables:
+      CHDIR: '../tests/samples/samples-bin'
+      TEST_BINARY: 'mnistCUDNN.sample'
+
